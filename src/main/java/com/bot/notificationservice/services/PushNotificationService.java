@@ -20,18 +20,25 @@ import org.springframework.stereotype.Service;
 import javax.annotation.PostConstruct;
 import java.io.ByteArrayInputStream;
 import java.io.InputStream;
+import java.nio.charset.StandardCharsets;
+import java.security.InvalidParameterException;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executor;
 import java.util.concurrent.ForkJoinPool;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.stream.Collectors;
 
 @Service
 public class PushNotificationService {
     private static final Logger LOGGER = LoggerFactory.getLogger(PushNotificationService.class);
+    public static final String DEFAULT_APP = FirebaseApp.DEFAULT_APP_NAME;
+
+    private final Map<String, FirebaseMessaging> messagingMap = new ConcurrentHashMap<>();
 
     @Autowired
     private ObjectMapper objectMapper;
@@ -44,64 +51,174 @@ public class PushNotificationService {
     FierhubService fierhubService;
 
     @PostConstruct
-    private void initializeFirebase() {
+    private void initializeDefaultFirebase() {
         try {
-            if (FirebaseApp.getApps().isEmpty()) {
-                Map<String, Object> serviceAccountMap = new HashMap<>();
-                serviceAccountMap.put("type", getServiceAccountKey("type", "service_account"));
-                serviceAccountMap.put("project_id", getServiceAccountKey("project_id", null));
-                serviceAccountMap.put("private_key_id", getServiceAccountKey("private_key_id", null));
-                serviceAccountMap.put("private_key", getServiceAccountKey("private_key", null));
-                serviceAccountMap.put("client_email", getServiceAccountKey("client_email", null));
-                serviceAccountMap.put("client_id", getServiceAccountKey("client_id", null));
-                serviceAccountMap.put("auth_uri", getServiceAccountKey("auth_uri", "https://accounts.google.com/o/oauth2/auth"));
-                serviceAccountMap.put("token_uri", getServiceAccountKey("token_uri", "https://oauth2.googleapis.com/token"));
-                serviceAccountMap.put("auth_provider_x509_cert_url", getServiceAccountKey("auth_provider_x509_cert_url", "https://www.googleapis.com/oauth2/v1/certs"));
-                serviceAccountMap.put("client_x509_cert_url", getServiceAccountKey("client_x509_cert_url", null));
-                serviceAccountMap.put("universe_domain", getServiceAccountKey("universe_domain", "googleapis.com"));
-
-                InputStream serviceAccountStream;
-                String privateKey = (String) serviceAccountMap.get("private_key");
-                if (privateKey != null && !privateKey.trim().isEmpty()) {
-                    if (privateKey.contains("\\n")) {
-                        serviceAccountMap.put("private_key", privateKey.replace("\\n", "\n"));
-                    }
-                    byte[] jsonBytes = objectMapper.writeValueAsBytes(serviceAccountMap);
-                    serviceAccountStream = new ByteArrayInputStream(jsonBytes);
-                    LOGGER.info("Loaded Firebase credentials via FierhubService configuration.");
-                } else {
-                    LOGGER.warn("Firebase private_key not found in FierhubService configuration. Falling back to serviceAccountKey.json");
-                    serviceAccountStream = PushNotificationService.class.getClassLoader()
-                            .getResourceAsStream("serviceAccountKey.json");
-                    if (serviceAccountStream == null) {
-                        LOGGER.warn("serviceAccountKey.json not found in classpath. Firebase initialization skipped.");
-                        return;
-                    }
-                }
-
-                FirebaseOptions options = FirebaseOptions.builder()
-                        .setCredentials(GoogleCredentials.fromStream(serviceAccountStream))
-                        .build();
-                FirebaseApp.initializeApp(options);
-                LOGGER.info("Firebase has been initialized successfully.");
-            }
+            LOGGER.info("Initializing default Firebase application at startup...");
+            getFirebaseMessaging(DEFAULT_APP);
         } catch (Exception ex) {
-            LOGGER.error("Failed to initialize Firebase: {}", ex.getMessage());
+            LOGGER.warn("Default Firebase initialization at startup deferred: {}", ex.getMessage());
         }
     }
 
-    private String getServiceAccountKey(String key, String defaultValue) {
-        String value = fierhubService.getConfiguration(key, String.class);
-        if (value == null || value.trim().isEmpty()) {
-            value = fierhubService.getConfiguration("firebase." + key, String.class);
+    /**
+     * Retrieves an existing FirebaseMessaging instance for the target app,
+     * or initializes a new named FirebaseApp dynamically and caches it.
+     */
+    public FirebaseMessaging getFirebaseMessaging(String appName) {
+        String targetApp = (appName == null || appName.isBlank()) ? DEFAULT_APP : appName.trim();
+        FirebaseMessaging messaging = messagingMap.get(targetApp);
+        if (messaging != null) {
+            return messaging;
         }
-        if (value == null || value.trim().isEmpty()) {
-            value = fierhubService.getConfiguration("firebase." + key.replace('_', '-'), String.class);
+
+        synchronized (this) {
+            messaging = messagingMap.get(targetApp);
+            if (messaging != null) {
+                return messaging;
+            }
+
+            messaging = initFirebaseMessaging(targetApp);
+            messagingMap.put(targetApp, messaging);
+            return messaging;
         }
-        if (value == null || value.trim().isEmpty()) {
-            value = defaultValue;
+    }
+
+    private FirebaseMessaging initFirebaseMessaging(String appName) {
+        for (FirebaseApp existingApp : FirebaseApp.getApps()) {
+            if (existingApp.getName().equals(appName)) {
+                LOGGER.info("Found existing FirebaseApp instance for [{}]. Reusing.", appName);
+                return FirebaseMessaging.getInstance(existingApp);
+            }
         }
+
+        try {
+            InputStream serviceAccountStream = loadServiceAccountStream(appName);
+            if (serviceAccountStream == null) {
+                if (!DEFAULT_APP.equals(appName)) {
+                    LOGGER.warn("No credentials configured for application [{}]. Falling back to DEFAULT FirebaseApp.", appName);
+                    return getFirebaseMessaging(DEFAULT_APP);
+                }
+                throw new IllegalStateException("Credentials missing for application: " + appName);
+            }
+
+            FirebaseOptions options = FirebaseOptions.builder()
+                    .setCredentials(GoogleCredentials.fromStream(serviceAccountStream))
+                    .build();
+
+            FirebaseApp app;
+            if (DEFAULT_APP.equals(appName)) {
+                app = FirebaseApp.initializeApp(options);
+            } else {
+                app = FirebaseApp.initializeApp(options, appName);
+            }
+
+            LOGGER.info("Firebase application [{}] initialized successfully.", appName);
+            return FirebaseMessaging.getInstance(app);
+        } catch (Exception ex) {
+            LOGGER.error("Failed to initialize Firebase for application [{}]: {}", appName, ex.getMessage());
+            throw new RuntimeException("Failed to initialize Firebase for application: " + appName, ex);
+        }
+    }
+
+    private InputStream loadServiceAccountStream(String appName) throws Exception {
+        String rawJson = getServiceAccountJson(appName);
+        if (rawJson != null && !rawJson.isBlank()) {
+            LOGGER.info("Loaded raw JSON service account for app [{}] via FierhubService.", appName);
+            return new ByteArrayInputStream(rawJson.getBytes(StandardCharsets.UTF_8));
+        }
+
+        Map<String, Object> serviceAccountMap = new HashMap<>();
+        serviceAccountMap.put("type", getServiceAccountKey(appName, "type", "service_account"));
+        serviceAccountMap.put("project_id", getServiceAccountKey(appName, "project_id", null));
+        serviceAccountMap.put("private_key_id", getServiceAccountKey(appName, "private_key_id", null));
+        serviceAccountMap.put("private_key", getServiceAccountKey(appName, "private_key", null));
+        serviceAccountMap.put("client_email", getServiceAccountKey(appName, "client_email", null));
+        serviceAccountMap.put("client_id", getServiceAccountKey(appName, "client_id", null));
+        serviceAccountMap.put("auth_uri", getServiceAccountKey(appName, "auth_uri", "https://accounts.google.com/o/oauth2/auth"));
+        serviceAccountMap.put("token_uri", getServiceAccountKey(appName, "token_uri", "https://oauth2.googleapis.com/token"));
+        serviceAccountMap.put("auth_provider_x509_cert_url", getServiceAccountKey(appName, "auth_provider_x509_cert_url", "https://www.googleapis.com/oauth2/v1/certs"));
+        serviceAccountMap.put("client_x509_cert_url", getServiceAccountKey(appName, "client_x509_cert_url", null));
+        serviceAccountMap.put("universe_domain", getServiceAccountKey(appName, "universe_domain", "googleapis.com"));
+
+        String privateKey = (String) serviceAccountMap.get("private_key");
+        if (privateKey != null && !privateKey.trim().isEmpty()) {
+            if (privateKey.contains("\\n")) {
+                serviceAccountMap.put("private_key", privateKey.replace("\\n", "\n"));
+            }
+            byte[] jsonBytes = objectMapper.writeValueAsBytes(serviceAccountMap);
+            LOGGER.info("Loaded Firebase credentials for app [{}] via FierhubService configuration.", appName);
+            return new ByteArrayInputStream(jsonBytes);
+        }
+
+        if (DEFAULT_APP.equals(appName)) {
+            LOGGER.warn("Firebase private_key not found in FierhubService for [DEFAULT]. Falling back to serviceAccountKey.json");
+            return PushNotificationService.class.getClassLoader().getResourceAsStream("serviceAccountKey.json");
+        }
+
+        return null;
+    }
+
+    private String getServiceAccountJson(String appName) {
+        if (!DEFAULT_APP.equals(appName)) {
+            String json = fierhubService.getConfiguration(appName + ".firebase.service-account", String.class);
+            if (json == null || json.isBlank()) {
+                json = fierhubService.getConfiguration("firebase." + appName + ".service-account", String.class);
+            }
+            if (json == null || json.isBlank()) {
+                json = fierhubService.getConfiguration(appName + ".service-account", String.class);
+            }
+            if (json != null && !json.isBlank()) {
+                return json;
+            }
+        }
+        String json = fierhubService.getConfiguration("firebase.service-account", String.class);
+        if (json == null || json.isBlank()) {
+            json = fierhubService.getConfiguration("service-account", String.class);
+        }
+        return json;
+    }
+
+    private String getServiceAccountKey(String appName, String key, String defaultValue) {
+        String value = null;
+        if (!DEFAULT_APP.equals(appName)) {
+            value = fierhubService.getConfiguration(appName + "." + key, String.class);
+            if (value == null || value.trim().isEmpty()) {
+                throw new InvalidParameterException("Service account detail not found for: " + appName + "." + key);
+            }
+        }
+
         return value;
+    }
+
+    public String resolveAppId(NotificationMessage model) {
+        if (model == null) {
+            return DEFAULT_APP;
+        }
+        if (model.getAppId() != null && !model.getAppId().isBlank()) {
+            return model.getAppId().trim();
+        }
+        if (model.getTenantId() != null && !model.getTenantId().isBlank()) {
+            return model.getTenantId().trim();
+        }
+        if (model.getCompanyId() != null && !model.getCompanyId().isBlank()) {
+            return model.getCompanyId().trim();
+        }
+        if (model.getData() != null && !model.getData().isEmpty()) {
+            String candidate = model.getData().get("appId");
+            if (candidate == null || candidate.isBlank()) {
+                candidate = model.getData().get("applicationId");
+            }
+            if (candidate == null || candidate.isBlank()) {
+                candidate = model.getData().get("tenantId");
+            }
+            if (candidate == null || candidate.isBlank()) {
+                candidate = model.getData().get("companyId");
+            }
+            if (candidate != null && !candidate.isBlank()) {
+                return candidate.trim();
+            }
+        }
+        return DEFAULT_APP;
     }
 
     public String processNotification(String kafkaMessage) throws Exception {
@@ -147,18 +264,24 @@ public class PushNotificationService {
         LOGGER.info("Processing batch of {} notifications in parallel", list.size());
         Executor executor = notificationExecutor != null ? notificationExecutor : ForkJoinPool.commonPool();
 
-        // Firebase sendEach accepts up to 500 messages per call
-        int batchSize = 500;
-        List<List<NotificationMessage>> subBatches = new ArrayList<>();
-        for (int i = 0; i < list.size(); i += batchSize) {
-            subBatches.add(list.subList(i, Math.min(i + batchSize, list.size())));
-        }
+        // Group messages by target application / tenant
+        Map<String, List<NotificationMessage>> groupedByApp = list.stream()
+                .collect(Collectors.groupingBy(this::resolveAppId));
 
+        int batchSize = 500;
         AtomicInteger successCount = new AtomicInteger(0);
         AtomicInteger failureCount = new AtomicInteger(0);
 
-        List<CompletableFuture<Void>> futures = subBatches.stream()
-                .map(subBatch -> CompletableFuture.runAsync(() -> {
+        List<CompletableFuture<Void>> futures = new ArrayList<>();
+
+        for (Map.Entry<String, List<NotificationMessage>> entry : groupedByApp.entrySet()) {
+            String appId = entry.getKey();
+            List<NotificationMessage> appList = entry.getValue();
+            FirebaseMessaging messaging = getFirebaseMessaging(appId);
+
+            for (int i = 0; i < appList.size(); i += batchSize) {
+                List<NotificationMessage> subBatch = appList.subList(i, Math.min(i + batchSize, appList.size()));
+                futures.add(CompletableFuture.runAsync(() -> {
                     List<Message> firebaseMessages = new ArrayList<>();
                     for (NotificationMessage item : subBatch) {
                         try {
@@ -174,28 +297,30 @@ public class PushNotificationService {
 
                     if (!firebaseMessages.isEmpty()) {
                         try {
-                            BatchResponse response = FirebaseMessaging.getInstance().sendEach(firebaseMessages);
+                            BatchResponse response = messaging.sendEach(firebaseMessages);
                             successCount.addAndGet(response.getSuccessCount());
                             failureCount.addAndGet(response.getFailureCount());
                             if (response.getFailureCount() > 0) {
-                                LOGGER.warn("Firebase batch finished with {} successes and {} failures out of {} messages",
-                                        response.getSuccessCount(), response.getFailureCount(), firebaseMessages.size());
+                                LOGGER.warn("Firebase batch for app [{}] finished with {} successes and {} failures out of {} messages",
+                                        appId, response.getSuccessCount(), response.getFailureCount(), firebaseMessages.size());
                             }
                         } catch (Exception ex) {
                             failureCount.addAndGet(firebaseMessages.size());
-                            LOGGER.error("Failed to send Firebase batch of {} messages: {}", firebaseMessages.size(), ex.getMessage(), ex);
+                            LOGGER.error("Failed to send Firebase batch of {} messages for app [{}]: {}",
+                                    firebaseMessages.size(), appId, ex.getMessage(), ex);
                         }
                     }
-                }, executor))
-                .toList();
+                }, executor));
+            }
+        }
 
         CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
 
-        LOGGER.info("Parallel notification batch completed: {}/{} sent successfully ({} failed)",
-                successCount.get(), list.size(), failureCount.get());
+        LOGGER.info("Parallel notification batch completed across {} app(s): {}/{} sent successfully ({} failed)",
+                groupedByApp.size(), successCount.get(), list.size(), failureCount.get());
 
-        return String.format("Processed batch of %d notifications: %d succeeded, %d failed",
-                list.size(), successCount.get(), failureCount.get());
+        return String.format("Processed batch of %d notifications across %d app(s): %d succeeded, %d failed",
+                list.size(), groupedByApp.size(), successCount.get(), failureCount.get());
     }
 
     public Message createFirebaseMessage(NotificationMessage notificationMessage) {
@@ -269,9 +394,12 @@ public class PushNotificationService {
             throw new IllegalArgumentException("Notification model cannot be null");
         }
 
+        String targetApp = resolveAppId(notificationMessage);
+        FirebaseMessaging messaging = getFirebaseMessaging(targetApp);
+
         Message message = createFirebaseMessage(notificationMessage);
-        String response = FirebaseMessaging.getInstance().send(message);
-        LOGGER.info("Successfully sent push notification via Firebase: {}", response);
+        String response = messaging.send(message);
+        LOGGER.info("Successfully sent push notification via Firebase [app: {}]: {}", targetApp, response);
         return response;
     }
 

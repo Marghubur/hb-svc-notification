@@ -15,6 +15,15 @@ import java.util.Map;
 @AllArgsConstructor
 @JsonIgnoreProperties(ignoreUnknown = true)
 public class NotificationMessage {
+    @JsonProperty("appId")
+    private String appId;
+
+    @JsonProperty("tenantId")
+    private String tenantId;
+
+    @JsonProperty("companyId")
+    private String companyId;
+
     @JsonProperty("rowIndex")
     private long rowIndex;
 
